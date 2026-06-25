@@ -96,47 +96,65 @@ const POLL_HTML = String.raw`<!doctype html>
   var pending = new Map();
   var seq = 0;
   var pollId = null;
+  var hostPort = null;     // 若宿主用 MessageChannel 传端口，则用它收发
+  var initSent = false;
 
   function dbg(tag, obj) {
     var el = document.getElementById("dbg");
     if (!el) return;
-    var line = tag + " " + (typeof obj === "string" ? obj : JSON.stringify(obj));
-    el.textContent = line + "\n" + el.textContent;
+    var s;
+    try { s = (typeof obj === "string") ? obj : JSON.stringify(obj); }
+    catch (e) { s = String(obj); }
+    el.textContent = tag + " " + s + "\n" + el.textContent;
   }
 
-  // 监听来自宿主(Cowork)的消息
-  window.addEventListener("message", function (ev) {
-    var msg = ev.data;
-    if (!msg || typeof msg !== "object") return;
-    dbg("⬇ IN", msg);
+  // 统一发送：优先走宿主端口，否则 postMessage 给 parent
+  function post(payload) {
+    dbg("⬆ OUT", payload);
+    try {
+      if (hostPort) hostPort.postMessage(payload);
+      else parent.postMessage(payload, "*");
+    } catch (e) { dbg("✖ post error", String(e)); }
+  }
 
-    // 1) 我们发出的请求的响应
+  // 处理任意来源进来的一条消息（原样记录每一条）
+  function handle(msg, origin) {
+    dbg("⬇ IN" + (origin ? "(" + origin + ")" : ""), msg);
+    if (!msg || typeof msg !== "object") return;
+
+    // 1) 我方请求的响应
     if (msg.id != null && pending.has(msg.id)) {
-      var p = pending.get(msg.id);
-      pending.delete(msg.id);
-      if (msg.error) p.reject(msg.error);
-      else p.resolve(msg.result);
+      var p = pending.get(msg.id); pending.delete(msg.id);
+      if (msg.error) p.reject(msg.error); else p.resolve(msg.result);
       return;
     }
 
-    // 2) tool-result 通知（挂载时宿主把工具结果推给 widget）
+    // 2) tool-result（挂载数据）/ 任何带 method 的通知都查一下
     var method = msg.method || "";
-    if (method.indexOf("tool-result") >= 0 || method.indexOf("toolresult") >= 0) {
+    if (method.indexOf("tool-result") >= 0 || method.indexOf("toolresult") >= 0
+        || method.indexOf("render") >= 0) {
       var params = msg.params || {};
-      // CallToolResult 可能是 params 本身，也可能嵌在 params.result
-      var result = params.result || params;
-      render(result);
+      render(params.result || params.toolResult || params);
+      return;
     }
+  }
+
+  // window 消息（同时捕获可能的端口转移）
+  window.addEventListener("message", function (ev) {
+    if (ev.ports && ev.ports.length && !hostPort) {
+      hostPort = ev.ports[0];
+      try { hostPort.start && hostPort.start(); } catch (e) {}
+      hostPort.onmessage = function (e) { handle(e.data, "port"); };
+      dbg("● 收到宿主 MessagePort", "");
+    }
+    handle(ev.data, ev.origin || "");
   });
 
-  // 向宿主发 JSON-RPC 请求
   function rpc(method, params) {
     return new Promise(function (resolve, reject) {
       var id = ++seq;
       pending.set(id, { resolve: resolve, reject: reject });
-      var payload = { jsonrpc: "2.0", id: id, method: method, params: params };
-      dbg("⬆ OUT", payload);
-      parent.postMessage(payload, "*");
+      post({ jsonrpc: "2.0", id: id, method: method, params: params });
       setTimeout(function () {
         if (pending.has(id)) { pending.delete(id); reject(new Error("timeout: " + method)); }
       }, 15000);
@@ -145,8 +163,8 @@ const POLL_HTML = String.raw`<!doctype html>
 
   function render(result) {
     if (!result) return;
-    var data = result.structuredContent || result;
-    if (!data || !data.tallies) return;
+    var data = result.structuredContent || result.structured_content || result;
+    if (!data || !data.tallies) { dbg("… 有数据但无 tallies", result); return; }
     pollId = data.pollId || pollId;
 
     document.getElementById("status").style.display = "none";
@@ -170,26 +188,40 @@ const POLL_HTML = String.raw`<!doctype html>
     });
   }
 
-  // 投票 → tools/call 回到你的服务器
   function vote(choice) {
     rpc("tools/call", { name: "cast_vote", arguments: { pollId: pollId, choice: choice } })
       .then(function (r) { render(r); })
       .catch(function (err) { dbg("✖ vote error", String(err && err.message || err)); });
   }
 
-  // 把话交回给 Agent（注入到对话里）
   document.getElementById("discuss").onclick = function () {
     rpc("ui/message", { content: "请总结这个投票的结果，并给出场地建议。" })
-      .catch(function (err) { dbg("✖ ui/message error", String(err && err.message || err)); });
+      .catch(function (e) { dbg("✖ ui/message", String(e)); });
   };
-
-  // 切换全屏显示模式
   document.getElementById("full").onclick = function () {
     rpc("ui/request-display-mode", { mode: "fullscreen" })
-      .catch(function (err) { dbg("✖ display-mode error", String(err && err.message || err)); });
+      .catch(function (e) { dbg("✖ display-mode", String(e)); });
   };
 
-  dbg("● widget ready", "");
+  // —— 关键修复：widget 主动向宿主发起握手 ——
+  // 之前一直没数据，是因为从没跟宿主打招呼。这里做标准 MCP 初始化，
+  // 并补几个常见的 ready 信号兜底，全部记录到 DEBUG 以便对齐。
+  dbg("● widget ready，开始握手", "");
+  initSent = true;
+  rpc("initialize", {
+    protocolVersion: "2026-01-26",
+    capabilities: {},
+    clientInfo: { name: "quick-poll-widget", version: "1.0.0" }
+  }).then(function (res) {
+    dbg("✓ initialize 成功", res);
+    post({ jsonrpc: "2.0", method: "notifications/initialized" });
+  }).catch(function (e) {
+    dbg("… initialize 超时/无响应，尝试兜底 ready", String(e && e.message || e));
+    post({ jsonrpc: "2.0", method: "notifications/initialized" });
+    post({ type: "ready" });
+    post({ type: "mcp-app:ready" });
+    post({ type: "iframe-ready" });
+  });
 })();
 </script>
 </body>
