@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const RESOURCE_URI = "ui://quick-poll/poll-v3.html";
+const RESOURCE_URI = "ui://quick-poll/poll-v4.html";
 
 // ───────────────────────── 简易内存存储（演示用，真实环境换成数据库） ─────────────────────────
 /** pollId -> { question, options:[], tallies:{ option: count } } */
@@ -197,9 +197,10 @@ const POLL_HTML = String.raw`<!doctype html>
   document.getElementById("discuss").onclick = function () {
     var text = "请总结这个投票的结果，并给出场地建议。";
     dbg("● 点击：请 Agent 总结", "");
-    rpc("ui/message", { content: text })
+    // 宿主要求 MCP 标准消息格式：role:"user" + content 数组
+    rpc("ui/message", { role: "user", content: [{ type: "text", text: text }] })
       .then(function (r) { dbg("✓ ui/message 成功", r); })
-      .catch(function (e) { dbg("✖ ui/message 错误（看 expected/path）", e); });
+      .catch(function (e) { dbg("✖ ui/message 错误", e); });
   };
   document.getElementById("full").onclick = function () {
     rpc("ui/request-display-mode", { mode: "fullscreen" })
