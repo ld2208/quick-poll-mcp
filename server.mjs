@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const RESOURCE_URI = "ui://quick-poll/poll-v4.html";
+const RESOURCE_URI = "ui://quick-poll/poll-v5.html";
 
 // ───────────────────────── 简易内存存储（演示用，真实环境换成数据库） ─────────────────────────
 /** pollId -> { question, options:[], tallies:{ option: count } } */
@@ -96,6 +96,7 @@ const POLL_HTML = String.raw`<!doctype html>
   var pending = new Map();
   var seq = 0;
   var pollId = null;
+  var current = null;      // 最近一次渲染的投票数据（含最新票数）
   var hostPort = null;     // 若宿主用 MessageChannel 传端口，则用它收发
   var initSent = false;
 
@@ -166,6 +167,7 @@ const POLL_HTML = String.raw`<!doctype html>
     var data = result.structuredContent || result.structured_content || result;
     if (!data || !data.tallies) { dbg("… 有数据但无 tallies", result); return; }
     pollId = data.pollId || pollId;
+    current = data;          // 记住最新票数，供“请 Agent 总结”使用
 
     document.getElementById("status").style.display = "none";
     document.getElementById("q").textContent = data.question || "投票";
@@ -195,8 +197,20 @@ const POLL_HTML = String.raw`<!doctype html>
   }
 
   document.getElementById("discuss").onclick = function () {
-    var text = "请总结这个投票的结果，并给出场地建议。";
-    dbg("● 点击：请 Agent 总结", "");
+    // 关键：把 widget 当前的真实票数写进发给 Agent 的话里。
+    // 因为投票走的是 widget↔服务器，Agent 并不知道最新票数，
+    // 而 Cowork 不支持 ui/update-model-context，所以只能由消息文本携带。
+    var text;
+    if (current && current.tallies) {
+      var keys = Object.keys(current.tallies);
+      var total = keys.reduce(function (a, k) { return a + current.tallies[k]; }, 0);
+      var parts = keys.map(function (k) { return k + " " + current.tallies[k] + " 票"; }).join("、");
+      text = "投票「" + (current.question || "投票") + "」的最新结果：" + parts +
+             "（共 " + total + " 票）。请据此总结哪个选项领先，并给出场地建议。";
+    } else {
+      text = "请总结这个投票的结果，并给出场地建议。";
+    }
+    dbg("● 点击：请 Agent 总结", text);
     // 宿主要求 MCP 标准消息格式：role:"user" + content 数组
     rpc("ui/message", { role: "user", content: [{ type: "text", text: text }] })
       .then(function (r) { dbg("✓ ui/message 成功", r); })
