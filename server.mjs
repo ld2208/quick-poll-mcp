@@ -18,7 +18,7 @@ import {
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const RESOURCE_URI = "ui://quick-poll/poll.html";
+const RESOURCE_URI = "ui://quick-poll/poll-v2.html";
 
 // ───────────────────────── 简易内存存储（演示用，真实环境换成数据库） ─────────────────────────
 /** pollId -> { question, options:[], tallies:{ option: count } } */
@@ -203,25 +203,36 @@ const POLL_HTML = String.raw`<!doctype html>
       .catch(function (e) { dbg("✖ display-mode", String(e)); });
   };
 
-  // —— 关键修复：widget 主动向宿主发起握手 ——
-  // 之前一直没数据，是因为从没跟宿主打招呼。这里做标准 MCP 初始化，
-  // 并补几个常见的 ready 信号兜底，全部记录到 DEBUG 以便对齐。
-  dbg("● widget ready，开始握手", "");
+  // —— 关键修复：按 SEP-1865 规范握手 ——
+  // 方法名必须带 ui/ 前缀：ui/initialize → ui/notifications/initialized。
+  // 宿主收到 initialized 之后，才会推 ui/notifications/tool-result（投票数据）。
+  dbg("● widget v2 ready，发起 ui/initialize", "");
   initSent = true;
-  rpc("initialize", {
+  var initializedSent = false;
+  function sendInitialized(reason) {
+    if (initializedSent) return;
+    initializedSent = true;
+    dbg("→ 发送 ui/notifications/initialized", reason || "");
+    post({ jsonrpc: "2.0", method: "ui/notifications/initialized" });
+  }
+  rpc("ui/initialize", {
     protocolVersion: "2026-01-26",
     capabilities: {},
-    clientInfo: { name: "quick-poll-widget", version: "1.0.0" }
+    clientInfo: { name: "quick-poll-widget", version: "1.0.0" },
+    appCapabilities: {
+      tools: {},
+      availableDisplayModes: ["inline", "fullscreen"]
+    }
   }).then(function (res) {
-    dbg("✓ initialize 成功", res);
-    post({ jsonrpc: "2.0", method: "notifications/initialized" });
+    dbg("✓ ui/initialize 成功", res);
+    sendInitialized("on-init-result");
+    try { if (res && (res.structuredContent || res.tallies)) render(res); } catch (e) {}
   }).catch(function (e) {
-    dbg("… initialize 超时/无响应，尝试兜底 ready", String(e && e.message || e));
-    post({ jsonrpc: "2.0", method: "notifications/initialized" });
-    post({ type: "ready" });
-    post({ type: "mcp-app:ready" });
-    post({ type: "iframe-ready" });
+    dbg("✖ ui/initialize 失败", String(e && e.message || e));
   });
+  // 防御：即使没正确收到 initialize 响应，也在短延时后补发 initialized，
+  // 避免宿主因等不到 initialized 而判定“未及时响应”。
+  setTimeout(function () { sendInitialized("fallback-timer"); }, 800);
 })();
 </script>
 </body>
